@@ -97,16 +97,25 @@ namespace WinUnlink
 
         public static LockScanResult Scan(string absoluteFilePath)
         {
+            return ScanFiles(new string[] { absoluteFilePath });
+        }
+
+        internal static LockScanResult ScanFiles(IList<string> absoluteFilePaths)
+        {
             LockScanResult result = new LockScanResult();
             uint session = 0;
             bool started = false;
             try
             {
-                if (String.IsNullOrWhiteSpace(absoluteFilePath) ||
-                    !Path.IsPathRooted(absoluteFilePath))
+                if (absoluteFilePaths == null)
                 {
-                    result.Error = "占用查询需要绝对文件路径。";
+                    result.Error = "占用查询需要文件路径列表。";
                     return result;
+                }
+                foreach (string path in absoluteFilePaths)
+                {
+                    if (String.IsNullOrWhiteSpace(path) || !Path.IsPathRooted(path))
+                    { result.Error = "占用查询需要绝对文件路径。"; return result; }
                 }
 
                 string earlierCleanup = RetryCleanup();
@@ -116,6 +125,8 @@ namespace WinUnlink
                     return result;
                 }
 
+                if (absoluteFilePaths.Count == 0) { result.IsComplete = true; return result; }
+
                 uint error = RmStartSession(out session, 0, new StringBuilder(SessionKeyLength));
                 if (error != 0)
                 {
@@ -124,7 +135,9 @@ namespace WinUnlink
                 }
                 started = true;
 
-                error = RmRegisterResources(session, 1, new string[] { absoluteFilePath },
+                string[] resources = new string[absoluteFilePaths.Count];
+                absoluteFilePaths.CopyTo(resources, 0);
+                error = RmRegisterResources(session, checked((uint)resources.Length), resources,
                     0, IntPtr.Zero, 0, IntPtr.Zero);
                 if (error != 0)
                 {
@@ -149,16 +162,19 @@ namespace WinUnlink
                             result.Error = "Restart Manager 返回的进程数量超出查询缓冲区。";
                             return result;
                         }
+                        HashSet<string> processIdentities = new HashSet<string>();
                         for (int index = 0; index < count; index++)
                         {
                             ProcessInfo info = buffer[index];
+                            string identity = info.Process.ProcessId + ":" + info.Process.StartTime.ToInt64();
+                            if (!processIdentities.Add(identity)) continue;
                             LockingProcess process = new LockingProcess
                             {
                                 ProcessId = checked((int)info.Process.ProcessId),
                                 StartTimeFileTime = info.Process.StartTime.ToInt64(),
                                 ApplicationName = info.ApplicationName ?? String.Empty,
                                 Name = info.ApplicationName ?? String.Empty,
-                                ImagePath = String.Empty,
+                                ImagePath = null,
                                 ServiceName = info.ServiceName ?? String.Empty,
                                 Kind = (LockProcessKind)info.ApplicationType,
                                 Type = TypeName(info.ApplicationType),

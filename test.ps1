@@ -19,7 +19,7 @@ $commonArguments = @('/nologo', '/target:exe', '/optimize+', '/codepage:65001', 
     ('/platform:' + $Platform.ToLowerInvariant()),
     ('/win32manifest:' + (Join-Path $projectRoot 'src/app.manifest')),
     '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll', '/r:System.Xml.Linq.dll', '/r:System.Runtime.Serialization.dll')
-$testNames = @('IntegrationTests')
+$testNames = @('IntegrationTests', 'DirectoryIntegrationTests')
 if ($AllowRegistryTests -or $CompileOnly) { $testNames += 'MenuRegistrationTests' }
 if (-not $AllowRegistryTests -and -not $CompileOnly) {
     Write-Output 'SKIP registry tests: require explicit -AllowRegistryTests in an isolated Windows sandbox or VM.'

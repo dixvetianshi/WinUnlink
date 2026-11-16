@@ -21,13 +21,16 @@ namespace WinUnlink
     {
         // The UI confirms this exact process list before calling. Both the file
         // and each process retain their original owners' identity checks.
-        public static StopAndDeleteResult Execute(FileSnapshot target, IList<LockingProcess> processes)
+        public static StopAndDeleteResult Execute(TargetSnapshot target, IList<LockingProcess> processes,
+            DeleteMode mode = DeleteMode.RecycleBin)
         {
             StopAndDeleteResult result = new StopAndDeleteResult();
             try
             {
                 if (target == null || processes == null)
-                    throw new ArgumentException("请先查询目标文件及其占用进程。");
+                    throw new ArgumentException("请先查询目标文件或文件夹及其占用进程。");
+                if (mode != DeleteMode.RecycleBin && mode != DeleteMode.Permanent)
+                    throw new ArgumentException("删除方式无效。未停止进程或删除目标。");
                 HashSet<int> processIds = new HashSet<int>();
                 foreach (LockingProcess process in processes)
                 {
@@ -36,7 +39,7 @@ namespace WinUnlink
                     if (!processIds.Add(process.ProcessId))
                         throw new ArgumentException("停止列表包含重复的 PID。请重新查询并确认。");
                 }
-                FileOperations.VerifyTarget(target);
+                TargetOperations.Verify(target);
             }
             catch (Exception error)
             {
@@ -57,10 +60,10 @@ namespace WinUnlink
                 }
             }
 
-            result.FileResult = FileOperations.Delete(target);
+            result.FileResult = TargetOperations.Delete(target, mode);
             if (result.FileResult.Status == OperationStatus.Completed)
-                result.FileResult.Message = processes.Count == 0 ? "文件已删除，无需停止进程。" :
-                    "已停止 " + processes.Count + " 个占用进程，并自动删除目标文件。";
+                result.FileResult.Message = (processes.Count == 0 ? "无需停止进程，" : "已停止 " + processes.Count + " 个占用进程，") +
+                    (mode == DeleteMode.RecycleBin ? "目标已移到回收站。" : "目标已永久删除。");
             else if (processes.Count != 0)
                 result.FileResult.Message = "已停止所确认的 " + processes.Count + " 个进程，但文件删除未完成。\r\n" + result.FileResult.Message;
             return result;

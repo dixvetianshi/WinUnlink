@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Xml.Linq;
 using Microsoft.Win32;
@@ -21,8 +22,10 @@ namespace WinUnlinkTests
             string id = Guid.NewGuid().ToString("N");
             const string productRoot = @"Software\WinUnlink";
             const string integrationRoot = @"Software\WinUnlink\IntegrationTests";
-            string registryRoot = @"Software\WinUnlink\IntegrationTests\" + id;
-            string menuKey = registryRoot + @"\Menu";
+            string registryRoot = integrationRoot + "\\" + id;
+            string fileKey = registryRoot + @"\File";
+            string directoryKey = registryRoot + @"\Directory";
+            string[] menuKeys = { fileKey, directoryKey };
             string executable = Assembly.GetExecutingAssembly().Location;
             string casesDirectory = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(executable), "cases"));
             string testDirectory = Path.Combine(casesDirectory, id);
@@ -36,7 +39,6 @@ namespace WinUnlinkTests
             int exitCode = 0;
             try
             {
-                // Capture the original parent state before creating any registry keys.
                 using (RegistryKey existing = Registry.CurrentUser.OpenSubKey(productRoot))
                     productRootExisted = existing != null;
                 using (RegistryKey existing = Registry.CurrentUser.OpenSubKey(integrationRoot))
@@ -70,62 +72,134 @@ namespace WinUnlinkTests
                 Directory.CreateDirectory(testDirectory);
                 testDirectoryCreated = true;
 
-                ContextMenuRegistration registration = new ContextMenuRegistration(menuKey, testDirectory);
+                ContextMenuRegistration registration = new ContextMenuRegistration(menuKeys, testDirectory);
+                ContextMenuRegistration legacyFileOnly = new ContextMenuRegistration(fileKey, testDirectory);
+                string plan = new ContextMenuRegistration().Plan(executable);
+                Check(plan.Contains(ContextMenuRegistration.MenuKeyPath) &&
+                    plan.Contains(ContextMenuRegistration.DirectoryMenuKeyPath) && !plan.Contains(@"Directory\Background"),
+                    "默认计划同时覆盖文件和文件夹且不增加空白处菜单"); passed++;
+
                 MenuRegistrationResult first = registration.Install(executable);
-                Check(first.Changed && File.Exists(first.BackupPath), "安装前生成配置备份"); passed++;
-                XElement backup = XElement.Load(first.BackupPath);
-                Check((string)backup.Attribute("key") == menuKey && !(bool)backup.Attribute("existed"), "备份保留原始缺省状态"); passed++;
-                using (RegistryKey installed = Registry.CurrentUser.OpenSubKey(menuKey))
-                using (RegistryKey command = installed.OpenSubKey("command"))
-                    Check((string)command.GetValue("") == "\"" + executable + "\" --inspect \"%1\"", "中文与空格路径的菜单命令引用");
+                Check(first.Changed && first.BackupPaths.Length == 2 &&
+                    first.BackupPath == first.BackupPaths[0] && first.BackupPaths.All(File.Exists),
+                    "安装两项前分别生成配置备份"); passed++;
+                for (int i = 0; i < menuKeys.Length; i++)
+                {
+                    XElement backup = XElement.Load(first.BackupPaths[i]);
+                    Check((string)backup.Attribute("key") == menuKeys[i] && !(bool)backup.Attribute("existed"),
+                        "备份保留菜单原始缺省状态 " + i); passed++;
+                }
+                CheckCommand(fileKey, executable);
+                CheckCommand(directoryKey, executable);
                 passed++;
                 MenuRegistrationResult second = registration.Install(executable);
-                Check(!second.Changed && second.BackupPath == first.BackupPath && Directory.GetFiles(testDirectory).Length == 1,
-                    "重复安装保持幂等且保留首次备份"); passed++;
+                Check(!second.Changed && second.BackupPaths.SequenceEqual(first.BackupPaths) &&
+                    Directory.GetFiles(testDirectory, "*.xml").Length == 2,
+                    "重复安装两项保持幂等并保留首次备份"); passed++;
 
                 string movedExecutable = Path.Combine(testDirectory, "移 动 程序.exe");
                 File.Copy(executable, movedExecutable);
                 MenuRegistrationResult moved = registration.Install(movedExecutable);
-                Check(moved.Changed && moved.BackupPath == first.BackupPath, "移动程序后更新命令并保留原始备份"); passed++;
+                Check(moved.Changed && moved.BackupPaths.SequenceEqual(first.BackupPaths),
+                    "移动程序后更新两项命令并保留原始备份"); passed++;
+                CheckCommand(fileKey, movedExecutable);
+                CheckCommand(directoryKey, movedExecutable);
+                passed++;
                 MenuRegistrationResult removed = registration.Uninstall();
-                using (RegistryKey existing = Registry.CurrentUser.OpenSubKey(menuKey))
-                    Check(removed.Changed && existing == null && File.Exists(first.BackupPath), "卸载恢复原始状态并保留备份");
-                passed++;
-                Check(!registration.Uninstall().Changed, "重复卸载保持幂等"); passed++;
+                Check(removed.Changed && Missing(fileKey) && Missing(directoryKey) && first.BackupPaths.All(File.Exists),
+                    "卸载恢复两项缺省状态并保留备份"); passed++;
+                Check(!registration.Uninstall().Changed, "重复卸载两项保持幂等"); passed++;
 
-                using (RegistryKey foreign = Registry.CurrentUser.CreateSubKey(menuKey))
+                MenuRegistrationResult oldFile = legacyFileOnly.Install(executable);
+                string oldFileSnapshot = Snapshot(fileKey);
+                Check(Missing(directoryKey), "旧版 fixture 只注册文件菜单"); passed++;
+                MenuRegistrationResult upgrade = registration.Install(executable);
+                Check(upgrade.Changed && upgrade.BackupPaths.Length == 2 && upgrade.BackupPath == oldFile.BackupPath &&
+                    Snapshot(fileKey) == oldFileSnapshot && !Missing(directoryKey),
+                    "文件菜单已注册时仍新增文件夹并保留旧文件项与备份"); passed++;
+                Check(!registration.Install(executable).Changed, "补全后的两项注册保持幂等"); passed++;
+                registration.Uninstall();
+
+                legacyFileOnly.Install(executable);
+                string fileBeforeForeign = Snapshot(fileKey);
+                int backupsBeforeForeign = Directory.GetFiles(testDirectory, "*.xml").Length;
+                using (RegistryKey foreign = Registry.CurrentUser.CreateSubKey(directoryKey))
                     foreign.SetValue("UserChoice", "original");
-                bool rejected = false;
-                try { registration.Install(executable); }
-                catch (InvalidOperationException) { rejected = true; }
-                using (RegistryKey foreign = Registry.CurrentUser.OpenSubKey(menuKey))
-                    Check(rejected && (string)foreign.GetValue("UserChoice") == "original" && foreign.GetValueNames().Length == 1,
-                        "菜单名冲突时保留已有配置");
+                Expect<InvalidOperationException>(delegate { registration.Install(movedExecutable); });
+                using (RegistryKey foreign = Registry.CurrentUser.OpenSubKey(directoryKey))
+                    Check(Snapshot(fileKey) == fileBeforeForeign && (string)foreign.GetValue("UserChoice") == "original" &&
+                        foreign.GetValueNames().Length == 1 &&
+                        Directory.GetFiles(testDirectory, "*.xml").Length == backupsBeforeForeign,
+                        "文件夹菜单冲突的全量预检保留文件菜单并不产生新备份");
                 passed++;
-                Registry.CurrentUser.DeleteSubKeyTree(menuKey);
+                Expect<InvalidOperationException>(delegate { registration.Uninstall(); });
+                Check(Snapshot(fileKey) == fileBeforeForeign && !Missing(directoryKey),
+                    "卸载预检发现外来文件夹项时保留两项"); passed++;
+                Registry.CurrentUser.DeleteSubKeyTree(directoryKey);
+                registration.Uninstall();
+
+                using (RegistryKey foreign = Registry.CurrentUser.CreateSubKey(fileKey))
+                    foreign.SetValue("UserChoice", "original file");
+                Expect<InvalidOperationException>(delegate { registration.Install(executable); });
+                using (RegistryKey foreign = Registry.CurrentUser.OpenSubKey(fileKey))
+                    Check((string)foreign.GetValue("UserChoice") == "original file" && Missing(directoryKey),
+                        "文件菜单冲突时不创建文件夹菜单");
+                passed++;
+                Registry.CurrentUser.DeleteSubKeyTree(fileKey);
 
                 MenuRegistrationResult withEdit = registration.Install(executable);
-                using (RegistryKey edited = Registry.CurrentUser.OpenSubKey(menuKey, true)) edited.SetValue("UserChoice", "keep me");
-                rejected = false;
-                try { registration.Uninstall(); }
-                catch (InvalidOperationException) { rejected = true; }
-                using (RegistryKey edited = Registry.CurrentUser.OpenSubKey(menuKey, true))
+                string fileBeforeEdit = Snapshot(fileKey);
+                using (RegistryKey edited = Registry.CurrentUser.OpenSubKey(directoryKey, true))
+                    edited.SetValue("UserChoice", "keep me");
+                Expect<InvalidOperationException>(delegate { registration.Uninstall(); });
+                Expect<InvalidOperationException>(delegate { registration.Install(movedExecutable); });
+                using (RegistryKey edited = Registry.CurrentUser.OpenSubKey(directoryKey, true))
                 {
-                    Check(rejected && (string)edited.GetValue("UserChoice") == "keep me", "卸载时保留安装后的用户修改");
+                    Check(Snapshot(fileKey) == fileBeforeEdit && (string)edited.GetValue("UserChoice") == "keep me",
+                        "文件夹项被用户修改时安装和卸载都保留全部现有项");
                     edited.DeleteValue("UserChoice");
                 }
                 passed++;
 
-                string backupText = File.ReadAllText(withEdit.BackupPath);
-                File.WriteAllText(withEdit.BackupPath, "<invalid />");
-                rejected = false;
-                try { registration.Uninstall(); }
-                catch (InvalidDataException) { rejected = true; }
-                using (RegistryKey kept = Registry.CurrentUser.OpenSubKey(menuKey))
-                    Check(rejected && kept != null, "备份无效时保留当前菜单");
-                passed++;
-                File.WriteAllText(withEdit.BackupPath, backupText);
+                string fileBeforeBackupFailure = Snapshot(fileKey);
+                string directoryBeforeBackupFailure = Snapshot(directoryKey);
+                string folderBackupText = File.ReadAllText(withEdit.BackupPaths[1]);
+                File.WriteAllText(withEdit.BackupPaths[1], "<invalid />");
+                Expect<InvalidDataException>(delegate { registration.Uninstall(); });
+                Expect<InvalidDataException>(delegate { registration.Install(movedExecutable); });
+                Check(Snapshot(fileKey) == fileBeforeBackupFailure && Snapshot(directoryKey) == directoryBeforeBackupFailure,
+                    "文件夹备份无效时全量预检保留两项且不更新文件菜单"); passed++;
+                File.WriteAllText(withEdit.BackupPaths[1], folderBackupText);
                 registration.Uninstall();
+
+                legacyFileOnly.Install(movedExecutable);
+                string persistentSnapshot = Snapshot(fileKey);
+                Expect<InvalidOperationException>(delegate { registration.Install(movedExecutable, true); });
+                Check(Snapshot(fileKey) == persistentSnapshot && Missing(directoryKey),
+                    "不能把旧持久文件菜单当成临时菜单复用或新增临时文件夹项"); passed++;
+                registration.Uninstall();
+
+                MenuRegistrationResult temporaryFile = legacyFileOnly.Install(movedExecutable, true);
+                string temporarySnapshot = Snapshot(fileKey);
+                MenuRegistrationResult temporaryUpgrade = registration.Install(movedExecutable, true);
+                Check(temporaryUpgrade.Changed && temporaryUpgrade.BackupPath == temporaryFile.BackupPath &&
+                    Snapshot(fileKey) == temporarySnapshot && !Missing(directoryKey) &&
+                    temporaryUpgrade.BackupPaths.All(p => p.StartsWith(Path.Combine(testDirectory, "temporary-menu-backups"),
+                        StringComparison.OrdinalIgnoreCase)),
+                    "旧临时文件菜单补全文件夹时保留其状态和程序位置内的备份"); passed++;
+                AssertVolatile(fileKey);
+                AssertVolatile(fileKey + @"\command");
+                AssertVolatile(directoryKey);
+                AssertVolatile(directoryKey + @"\command");
+                passed++;
+                Check(!registration.Install(movedExecutable, true).Changed,
+                    "两项临时菜单重复启用保持幂等"); passed++;
+                Expect<InvalidOperationException>(delegate { registration.Install(movedExecutable, false); });
+                Check(Snapshot(fileKey) == temporarySnapshot && !Missing(directoryKey),
+                    "临时与持久模式不一致时保留两项"); passed++;
+                registration.Uninstall();
+                Check(Missing(fileKey) && Missing(directoryKey) && temporaryUpgrade.BackupPaths.All(File.Exists),
+                    "手动卸载两项临时菜单并保留配置备份"); passed++;
             }
             catch (Exception error)
             {
@@ -134,8 +208,9 @@ namespace WinUnlinkTests
             }
             finally
             {
-                // Clean only this run's owned GUID branch, then parents that this
-                // test created and that remain empty. Original/unknown keys stay.
+                // Only this run's owned GUID branch may be removed. Parent
+                // branches are removed only if this test created them and they
+                // remain empty; existing or unknown parent contents stay.
                 if (runRootCreated)
                     TryCleanup(delegate { Registry.CurrentUser.DeleteSubKeyTree(registryRoot, false); },
                         "本次测试 GUID 分支", ref exitCode);
@@ -157,6 +232,68 @@ namespace WinUnlinkTests
             }
             Console.WriteLine("RESULT menu tests passed=" + passed + " failed=" + (exitCode == 0 ? 0 : 1));
             return exitCode;
+        }
+
+        private static bool Missing(string path)
+        {
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(path)) return key == null;
+        }
+
+        private static string Snapshot(string path)
+        {
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(path))
+            {
+                if (key == null) return null;
+                string[] values = key.GetValueNames().OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                    .Select(n => n + "|" + key.GetValueKind(n) + "|" +
+                        Convert.ToString(key.GetValue(n, null, RegistryValueOptions.DoNotExpandEnvironmentNames))).ToArray();
+                using (RegistryKey command = key.OpenSubKey("command"))
+                    return String.Join("\n", values) + "\ncommand=" +
+                        (command == null ? "<missing>" : Convert.ToString(command.GetValue("")));
+            }
+        }
+
+        private static void CheckCommand(string path, string executable)
+        {
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(path))
+            using (RegistryKey command = key == null ? null : key.OpenSubKey("command"))
+                Check(command != null && (string)command.GetValue("") == "\"" + executable + "\" --inspect \"%1\"",
+                    "中文和空格路径的菜单命令引用：" + path);
+        }
+
+        private static void AssertVolatile(string path)
+        {
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(path, true))
+            {
+                if (key == null) throw new InvalidOperationException("临时菜单项缺失：" + path);
+                bool created = false;
+                bool refusedNonvolatile = false;
+                try
+                {
+                    using (RegistryKey child = key.CreateSubKey("nonvolatile-probe",
+                        RegistryKeyPermissionCheck.ReadWriteSubTree, RegistryOptions.None))
+                        created = child != null;
+                }
+                catch (IOException error)
+                {
+                    // ERROR_CHILD_MUST_BE_VOLATILE: a volatile key cannot contain
+                    // a nonvolatile child. This checks the actual registry flag.
+                    if ((error.HResult & 0xffff) != 1021) throw;
+                    refusedNonvolatile = true;
+                }
+                finally
+                {
+                    if (created) key.DeleteSubKey("nonvolatile-probe", false);
+                }
+                Check(refusedNonvolatile, "菜单项实际使用 Volatile：" + path);
+            }
+        }
+
+        private static void Expect<T>(Action action) where T : Exception
+        {
+            try { action(); }
+            catch (T) { return; }
+            throw new InvalidOperationException("预期的保护失败未出现：" + typeof(T).Name);
         }
 
         private static void DeleteEmptyKey(string path)

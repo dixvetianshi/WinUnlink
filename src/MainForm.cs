@@ -19,8 +19,11 @@ namespace WinUnlink
         private readonly DataGridView processGrid = new DataGridView();
         private readonly TextBox logBox = new TextBox();
         private readonly List<Control> workControls = new List<Control>();
+        private readonly List<Control> fileOnlyControls = new List<Control>();
+        private readonly ComboBox deleteModeBox = new ComboBox();
+        private Button rebootDeleteButton;
         private readonly string initialPath;
-        private FileSnapshot snapshot;
+        private TargetSnapshot snapshot;
         private LockScanResult scan = new LockScanResult();
         private bool busy;
 
@@ -28,7 +31,7 @@ namespace WinUnlink
         {
             initialPath = path;
             replacementBox.Text = source ?? "";
-            Text = "WinUnlink · 文件占用、删除与替换";
+            Text = "WinUnlink · 文件及文件夹占用、删除与替换";
             Font = new Font("Microsoft YaHei UI", 9.5F);
             BackColor = Color.FromArgb(246, 248, 251);
             ClientSize = new Size(1040, 750);
@@ -44,7 +47,7 @@ namespace WinUnlink
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 98));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 130));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 92));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
             Controls.Add(layout);
@@ -52,15 +55,15 @@ namespace WinUnlink
             Panel header = new Panel { Dock = DockStyle.Fill };
             header.Controls.Add(new Label { Text = "WinUnlink", AutoSize = true,
                 Font = new Font("Segoe UI", 24, FontStyle.Bold), ForeColor = Color.FromArgb(30, 55, 85), Location = new Point(0, 0) });
-            header.Controls.Add(new Label { Text = "删除或替换被占用的文件  ·  Windows 10 / 11",
+            header.Controls.Add(new Label { Text = "删除或替换被占用的文件、文件夹  ·  Windows 10 / 11",
                 AutoSize = true, ForeColor = Color.FromArgb(83, 97, 114), Location = new Point(3, 49) });
             layout.Controls.Add(header, 0, 0);
 
-            layout.Controls.Add(PathRow("目标文件", targetBox, "选择文件…", ChooseTarget, true), 0, 1);
-            layout.Controls.Add(PathRow("替换来源", replacementBox, "选择新文件…", ChooseReplacement, false), 0, 2);
+            layout.Controls.Add(PathRow("目标路径", targetBox, "选择目标…", ChooseTarget, true), 0, 1);
+            layout.Controls.Add(PathRow("替换来源", replacementBox, "选择来源…", ChooseReplacement, false), 0, 2);
             fileInfo.Dock = DockStyle.Fill;
             fileInfo.ForeColor = Color.FromArgb(74, 87, 103);
-            fileInfo.Text = "选择一个文件，或将文件拖到窗口。替换时来源文件会保留。";
+            fileInfo.Text = "选择文件或文件夹，或将它拖到窗口。替换来源会保留。";
             layout.Controls.Add(fileInfo, 0, 3);
             scanInfo.Dock = DockStyle.Fill;
             scanInfo.Text = "占用进程";
@@ -89,14 +92,31 @@ namespace WinUnlink
             workControls.Add(processGrid);
 
             FlowLayoutPanel actions = new FlowLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(0, 12, 0, 0), WrapContents = true };
-            actions.Controls.Add(ActionButton("删除文件", Color.FromArgb(180, 57, 55), async delegate { await OperateAsync(false, false); }));
+            Panel deletionOptions = new Panel { Width = 820, Height = 30, Margin = new Padding(0, 0, 0, 8) };
+            deletionOptions.Controls.Add(new Label { Text = "删除方式", AutoSize = true, Location = new Point(0, 5) });
+            deleteModeBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            deleteModeBox.Items.AddRange(new object[] { "移到回收站（默认）", "直接删除（永久）" });
+            deleteModeBox.SelectedIndex = 0;
+            deleteModeBox.Location = new Point(83, 0); deleteModeBox.Width = 196;
+            deletionOptions.Controls.Add(deleteModeBox);
+            deletionOptions.Controls.Add(new Label { Text = "仅影响删除；替换会永久移除旧目标内容。", AutoSize = true,
+                ForeColor = Color.FromArgb(83, 97, 114), Location = new Point(294, 5) });
+            workControls.Add(deleteModeBox);
+            actions.Controls.Add(deletionOptions);
+            actions.SetFlowBreak(deletionOptions, true);
+            actions.Controls.Add(ActionButton("删除目标", Color.FromArgb(180, 57, 55), async delegate { await OperateAsync(false, false); }));
             actions.Controls.Add(ActionButton("停止并删除", Color.FromArgb(155, 77, 33), async delegate { await StopAndDeleteAsync(); }));
-            actions.Controls.Add(ActionButton("替换文件", Color.FromArgb(41, 103, 168), async delegate { await OperateAsync(true, false); }));
+            actions.Controls.Add(ActionButton("替换目标", Color.FromArgb(41, 103, 168), async delegate { await OperateAsync(true, false); }));
             actions.Controls.Add(ActionButton("结束选中进程", Color.FromArgb(97, 108, 126), async delegate { await TerminateSelectedAsync(); }));
-            actions.Controls.Add(ActionButton("重启后删除", Color.FromArgb(97, 108, 126), async delegate { await OperateAsync(false, true); }));
-            actions.Controls.Add(ActionButton("重启后替换", Color.FromArgb(97, 108, 126), async delegate { await OperateAsync(true, true); }));
+            Button rebootDelete = ActionButton("重启后删除", Color.FromArgb(97, 108, 126), async delegate { await OperateAsync(false, true); });
+            Button rebootReplace = ActionButton("重启后替换", Color.FromArgb(97, 108, 126), async delegate { await OperateAsync(true, true); });
+            actions.Controls.Add(rebootDelete); actions.Controls.Add(rebootReplace);
+            fileOnlyControls.Add(rebootDelete); fileOnlyControls.Add(rebootReplace);
+            rebootDeleteButton = rebootDelete;
+            deleteModeBox.SelectedIndexChanged += delegate { UpdateDeletionOptions(); };
+            UpdateDeletionOptions();
             actions.Controls.Add(new Label { AutoSize = true, ForeColor = Color.FromArgb(83, 97, 114),
-                Text = "“停止并删除”会结束可处理的占用程序后自动删除。删除不进入回收站。", Margin = new Padding(0, 9, 0, 0) });
+                Text = "“停止并删除”会结束占用程序，再按所选方式处理目标。回收失败不会改为永久删除。", Margin = new Padding(0, 9, 0, 0) });
             layout.Controls.Add(actions, 0, 6);
 
             logBox.Dock = DockStyle.Fill;
@@ -111,7 +131,7 @@ namespace WinUnlink
             footer.Controls.Add(Link("注册右键菜单", RegisterMenu));
             footer.Controls.Add(Link("移除右键菜单", RemoveMenu));
             footer.Controls.Add(Link("以管理员重开", RelaunchElevated));
-            footer.Controls.Add(new Label { Text = "Win11：显示更多选项  ·  单文件操作", AutoSize = true,
+            footer.Controls.Add(new Label { Text = "Win11：显示更多选项  ·  文件 / 文件夹", AutoSize = true,
                 Margin = new Padding(18, 1, 0, 0), ForeColor = Color.FromArgb(99, 110, 124) });
             layout.Controls.Add(footer, 0, 8);
 
@@ -128,7 +148,7 @@ namespace WinUnlink
             DragDrop += async delegate(object sender, DragEventArgs e) {
                 string[] paths = e.Data.GetData(DataFormats.FileDrop) as string[];
                 if (!busy && paths != null && paths.Length == 1) { targetBox.Text = paths[0]; await RefreshAsync(); }
-                else if (paths != null && paths.Length != 1) MessageBox.Show(this, "每次请选择一个目标文件。", "WinUnlink");
+                else if (paths != null && paths.Length != 1) MessageBox.Show(this, "每次请选择一个目标文件或文件夹。", "WinUnlink");
             };
             FormClosing += delegate(object sender, FormClosingEventArgs e) {
                 if (busy) { e.Cancel = true; scanInfo.Text = "正在完成操作，请稍候…"; }
@@ -176,14 +196,30 @@ namespace WinUnlink
             link.Click += action; workControls.Add(link); return link;
         }
 
-        private async void ChooseTarget(object sender, EventArgs e)
+        private void ChooseTarget(object sender, EventArgs e)
         {
-            using (OpenFileDialog dialog = new OpenFileDialog { Title = "选择要删除或替换的目标文件", CheckFileExists = true })
-                if (dialog.ShowDialog(this) == DialogResult.OK) { targetBox.Text = dialog.FileName; await RefreshAsync(); }
+            ContextMenuStrip menu = new ContextMenuStrip();
+            menu.Items.Add("选择文件…", null, async delegate {
+                using (OpenFileDialog dialog = new OpenFileDialog { Title = "选择目标文件", CheckFileExists = true })
+                    if (dialog.ShowDialog(this) == DialogResult.OK) { targetBox.Text = dialog.FileName; await RefreshAsync(); }
+            });
+            menu.Items.Add("选择文件夹…", null, async delegate {
+                using (FolderBrowserDialog dialog = new FolderBrowserDialog { Description = "选择要删除或整体替换的文件夹", ShowNewFolderButton = false })
+                    if (dialog.ShowDialog(this) == DialogResult.OK) { targetBox.Text = dialog.SelectedPath; await RefreshAsync(); }
+            });
+            menu.Closed += delegate { menu.Dispose(); };
+            Control control = sender as Control;
+            if (control != null) menu.Show(control, new Point(0, control.Height));
         }
 
         private void ChooseReplacement(object sender, EventArgs e)
         {
+            if (snapshot != null && snapshot.IsDirectory)
+            {
+                using (FolderBrowserDialog dialog = new FolderBrowserDialog { Description = "选择替换来源文件夹（来源会保留）", ShowNewFolderButton = false })
+                    if (dialog.ShowDialog(this) == DialogResult.OK) replacementBox.Text = dialog.SelectedPath;
+                return;
+            }
             using (OpenFileDialog dialog = new OpenFileDialog { Title = "选择新文件（来源会保留）", CheckFileExists = true })
                 if (dialog.ShowDialog(this) == DialogResult.OK) replacementBox.Text = dialog.FileName;
         }
@@ -192,7 +228,22 @@ namespace WinUnlink
         {
             busy = value;
             foreach (Control control in workControls) control.Enabled = !value;
+            if (!value && snapshot != null && snapshot.IsDirectory)
+                foreach (Control control in fileOnlyControls) control.Enabled = false;
+            UpdateDeletionOptions();
             UseWaitCursor = value;
+        }
+
+        private DeleteMode SelectedDeleteMode
+        {
+            get { return deleteModeBox.SelectedIndex == 1 ? DeleteMode.Permanent : DeleteMode.RecycleBin; }
+        }
+
+        private void UpdateDeletionOptions()
+        {
+            if (rebootDeleteButton != null)
+                rebootDeleteButton.Enabled = !busy && SelectedDeleteMode == DeleteMode.Permanent &&
+                    (snapshot == null || !snapshot.IsDirectory);
         }
 
         private async Task<bool> RefreshAsync()
@@ -203,12 +254,14 @@ namespace WinUnlink
             scanInfo.Text = "正在查询占用进程…";
             try
             {
-                FileSnapshot fresh = await Task.Run(delegate { return FileOperations.Inspect(requestedPath); });
-                LockScanResult freshScan = await Task.Run(delegate { return LockInspector.Scan(fresh.Path); });
+                TargetSnapshot fresh = await Task.Run(delegate { return TargetOperations.Inspect(requestedPath); });
+                LockScanResult freshScan = await Task.Run(delegate { return TargetOperations.Scan(fresh); });
                 snapshot = fresh; scan = freshScan;
-                targetBox.Text = fresh.Path;
-                fileInfo.Text = "大小：" + fresh.Length.ToString("N0") + " 字节" + (fresh.IsReadOnly ? "  ·  只读" : "") +
-                    "\r\n文件标识：" + fresh.Identity;
+                targetBox.Text = fresh.Root.Path;
+                fileInfo.Text = (fresh.IsDirectory ? "文件夹：" + fresh.Directory.FileCount + " 个文件、" + fresh.Directory.DirectoryCount +
+                    " 个目录，共 " + fresh.Directory.TotalBytes.ToString("N0") + " 字节" :
+                    "大小：" + fresh.Root.Length.ToString("N0") + " 字节" + (fresh.Root.IsReadOnly ? "  ·  只读" : "")) +
+                    "\r\n文件标识：" + fresh.Root.Identity;
                 processGrid.Rows.Clear();
                 foreach (LockingProcess process in scan.Processes)
                 {
@@ -237,20 +290,26 @@ namespace WinUnlink
         {
             if (busy) return;
             if (replacement && String.IsNullOrWhiteSpace(replacementBox.Text))
-            { MessageBox.Show(this, "先选择替换来源文件。来源会保留，目标文件会被新内容替换。", "WinUnlink"); return; }
+            { MessageBox.Show(this, "先选择替换来源。文件夹会整体替换，来源会保留。", "WinUnlink"); return; }
             if (!await RefreshAsync()) return;
-            FileSnapshot selected = snapshot;
+            TargetSnapshot selected = snapshot;
             string source = replacementBox.Text;
-            string title = reboot ? (replacement ? "安排重启后替换" : "安排重启后删除") : (replacement ? "替换文件" : "删除文件");
-            using (ConfirmationDialog dialog = new ConfirmationDialog(title, selected.Path, replacement ? source : null, scan, reboot))
+            DeleteMode deletionMode = SelectedDeleteMode;
+            if (reboot && selected.IsDirectory)
+            { MessageBox.Show(this, "文件夹暂不支持重启排队，请关闭占用后重试。", "WinUnlink"); return; }
+            if (reboot && !replacement && deletionMode == DeleteMode.RecycleBin)
+            { MessageBox.Show(this, "回收站模式不支持重启排队。需要永久删除时请手动选择“直接删除”。", "WinUnlink"); return; }
+            string title = reboot ? (replacement ? "安排重启后替换" : "安排重启后删除") :
+                (replacement ? "替换" : "删除") + (selected.IsDirectory ? "文件夹" : "文件");
+            using (ConfirmationDialog dialog = new ConfirmationDialog(title, selected.Root.Path, replacement ? source : null, scan, reboot, false, selected.Directory, deletionMode))
                 if (dialog.ShowDialog(this) != DialogResult.OK) return;
             SetBusy(true);
             FileOperationResult result;
             try
             {
                 result = await Task.Run(delegate {
-                    if (reboot) return replacement ? FileOperations.ScheduleReplace(selected, source) : FileOperations.ScheduleDelete(selected);
-                    return replacement ? FileOperations.Replace(selected, source) : FileOperations.Delete(selected);
+                    if (reboot) return replacement ? TargetOperations.ScheduleReplace(selected, source) : TargetOperations.ScheduleDelete(selected, deletionMode);
+                    return replacement ? TargetOperations.Replace(selected, source) : TargetOperations.Delete(selected, deletionMode);
                 });
             }
             catch (Exception error) { result = new FileOperationResult { Status = OperationStatus.Failed, Message = error.Message }; }
@@ -261,7 +320,8 @@ namespace WinUnlink
         private async Task StopAndDeleteAsync()
         {
             if (busy || !await RefreshAsync()) return;
-            FileSnapshot selected = snapshot;
+            TargetSnapshot selected = snapshot;
+            DeleteMode deletionMode = SelectedDeleteMode;
             LockScanResult freshScan = scan;
             if (!freshScan.IsComplete)
             {
@@ -270,14 +330,14 @@ namespace WinUnlink
                 return;
             }
             List<LockingProcess> processes = freshScan.Processes.Where(process => process.CanTerminate).ToList();
-            using (ConfirmationDialog dialog = new ConfirmationDialog("停止并删除", selected.Path, null, freshScan, false, true))
+            using (ConfirmationDialog dialog = new ConfirmationDialog("停止并删除", selected.Root.Path, null, freshScan, false, true, selected.Directory, deletionMode))
                 if (dialog.ShowDialog(this) != DialogResult.OK) return;
 
             FileOperationResult fileResult;
             SetBusy(true);
             try
             {
-                StopAndDeleteResult result = await Task.Run(delegate { return StopAndDelete.Execute(selected, processes); });
+                StopAndDeleteResult result = await Task.Run(delegate { return StopAndDelete.Execute(selected, processes, deletionMode); });
                 foreach (ProcessStopResult outcome in result.Processes)
                     AppendLog(outcome.Process.Name + " (PID " + outcome.Process.ProcessId + ")：" +
                         (outcome.Stopped ? "已停止" : "未停止：" + outcome.Error));
@@ -292,17 +352,17 @@ namespace WinUnlink
             await ShowFileResultAsync(selected, fileResult, false);
         }
 
-        private async Task ShowFileResultAsync(FileSnapshot selected, FileOperationResult result, bool replacement)
+        private async Task ShowFileResultAsync(TargetSnapshot selected, FileOperationResult result, bool replacement)
         {
             string report = result.Message;
-            if (!String.IsNullOrEmpty(result.RetainedPath)) report += "\r\n保留文件：" + result.RetainedPath;
+            if (!String.IsNullOrEmpty(result.RetainedPath)) report += "\r\n保留位置：" + result.RetainedPath;
             AppendLog(report);
             MessageBox.Show(this, report, result.Status == OperationStatus.Completed ? "操作已完成" :
                 result.Status == OperationStatus.Scheduled ? "已安排重启后执行" : "操作结果",
                 MessageBoxButtons.OK, result.Status == OperationStatus.Completed || result.Status == OperationStatus.Scheduled ?
                 MessageBoxIcon.Information : MessageBoxIcon.Warning);
             if (result.Status == OperationStatus.Completed && !replacement)
-            { snapshot = null; scan = new LockScanResult(); processGrid.Rows.Clear(); scanInfo.Text = "文件已删除"; fileInfo.Text = selected.Path; }
+            { snapshot = null; scan = new LockScanResult(); processGrid.Rows.Clear(); scanInfo.Text = "文件已删除"; fileInfo.Text = selected.Root.Path; }
             else await RefreshAsync();
         }
 
@@ -375,7 +435,8 @@ namespace WinUnlink
 
     internal sealed class ConfirmationDialog : Form
     {
-        public ConfirmationDialog(string action, string target, string source, LockScanResult scan, bool reboot, bool stopAndDelete = false)
+        public ConfirmationDialog(string action, string target, string source, LockScanResult scan, bool reboot,
+            bool stopAndDelete = false, DirectorySnapshot directory = null, DeleteMode deleteMode = DeleteMode.RecycleBin)
         {
             Text = "确认" + action; Font = new Font("Microsoft YaHei UI", 9.5F);
             ClientSize = new Size(760, 430); MinimumSize = new Size(620, 380);
@@ -385,19 +446,26 @@ namespace WinUnlink
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 110));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48)); Controls.Add(layout);
+            string deletionDescription = deleteMode == DeleteMode.RecycleBin
+                ? "移到回收站，失败时不会改成永久删除。" : "永久删除，不进入回收站。";
             Label summary = new Label { Dock = DockStyle.Fill, Text = "目标：" + target +
                 (source == null ? "" : "\r\n替换来源：" + source) +
-                "\r\n\r\n" + (stopAndDelete ? "确认后结束下面标记为“将停止”的占用程序，再永久删除目标。结束程序可能丢失未保存的工作。" :
+                "\r\n\r\n" + (stopAndDelete ? "结束标记为“将停止”的程序后，" + deletionDescription + "结束程序可能丢失未保存的工作。" :
                 reboot ? "需要管理员权限。排队成功后仍需在重启后检查结果。" :
-                source == null ? "永久删除，不进入回收站。优先保留占用进程。" : "新内容替换目标，来源文件会保留。占用者可能继续使用旧内容。") };
+                directory != null ? (source == null ? "文件夹及其中全部内容：" + deletionDescription :
+                "整体替换文件夹，旧目标内容会永久移除，不进回收站。来源文件夹保留。") :
+                source == null ? deletionDescription : "新内容替换目标，旧目标内容永久移除。来源文件保留。") };
             layout.Controls.Add(summary, 0, 0);
             StringBuilder body = new StringBuilder("当前查询报告的占用进程：\r\n\r\n");
+            if (directory != null)
+                body.AppendLine("目标包含 " + directory.FileCount + " 个文件、" + directory.DirectoryCount + " 个文件夹。\r\n" +
+                    "占用查询覆盖其中的文件；目录句柄、当前工作目录或受保护占用仍可能无法列出。\r\n");
             foreach (LockingProcess process in scan.Processes)
             {
                 body.AppendLine(process.Name + "    PID " + process.ProcessId + "    " + process.Type +
                     "\r\n" + (String.IsNullOrEmpty(process.ImagePath) ? process.InspectionError ?? "路径不可查询" : process.ImagePath));
                 if (stopAndDelete)
-                    body.AppendLine(process.CanTerminate ? "将停止，然后自动删除目标文件。" :
+                    body.AppendLine(process.CanTerminate ? "将停止，然后按所选方式处理目标。" :
                         "不会停止：" + (String.IsNullOrEmpty(process.TerminationRestriction) ? "当前程序不允许结束。" : process.TerminationRestriction));
                 body.AppendLine();
             }

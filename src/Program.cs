@@ -33,8 +33,8 @@ namespace WinUnlink
                 if (args.Length != 0 && args[0] == "--help")
                 {
                     WriteReport(args, new CommandReport { Success = true, Message =
-                        "WinUnlink.exe [--inspect FILE] [--replacement SOURCE]\n" +
-                        "WinUnlink.exe --scan FILE [--report JSON]\n" +
+                        "WinUnlink.exe [--inspect FILE_OR_FOLDER] [--replacement SOURCE]\n" +
+                        "WinUnlink.exe --scan FILE_OR_FOLDER [--report JSON]\n" +
                         "WinUnlink.exe --install-menu --yes [--report JSON]\n" +
                         "WinUnlink.exe --install-menu-temporary --yes [--report JSON]\n" +
                         "WinUnlink.exe --uninstall-menu --yes [--report JSON]\n" +
@@ -68,12 +68,15 @@ namespace WinUnlink
 
         private static int ScanCommand(string[] args)
         {
-            if (args.Length < 2) throw new ArgumentException("--scan 后需要文件路径。");
-            FileSnapshot target = FileOperations.Inspect(args[1]);
-            LockScanResult result = LockInspector.Scan(target.Path);
+            if (args.Length < 2) throw new ArgumentException("--scan 后需要文件或文件夹路径。");
+            TargetSnapshot target = TargetOperations.Inspect(args[1]);
+            LockScanResult result = TargetOperations.Scan(target);
             WriteReport(args, new CommandReport { Success = result.IsComplete, Message = result.Error ??
                 "查询完成。此列表只覆盖 Restart Manager 报告结果，不能证明不存在其他占用。",
-                Target = target.Path, Identity = target.Identity, Processes = result.Processes.Select(p => new ProcessReport {
+                Target = target.Root.Path, Identity = target.Root.Identity, IsDirectory = target.IsDirectory,
+                FileCount = target.IsDirectory ? target.Directory.FileCount : 1,
+                DirectoryCount = target.IsDirectory ? target.Directory.DirectoryCount : 0,
+                Processes = result.Processes.Select(p => new ProcessReport {
                     Pid = p.ProcessId, Name = p.Name, Path = p.ImagePath, StartTimeFileTime = p.StartTimeFileTime,
                     Type = p.Type, CanTerminate = p.CanTerminate, Restriction = p.TerminationRestriction
                 }).ToList() });
@@ -156,6 +159,9 @@ namespace WinUnlink
         [DataMember] public string Message { get; set; }
         [DataMember(EmitDefaultValue = false)] public string Target { get; set; }
         [DataMember(EmitDefaultValue = false)] public string Identity { get; set; }
+        [DataMember] public bool IsDirectory { get; set; }
+        [DataMember] public int FileCount { get; set; }
+        [DataMember] public int DirectoryCount { get; set; }
         [DataMember(EmitDefaultValue = false)] public List<ProcessReport> Processes { get; set; }
         [DataMember(EmitDefaultValue = false)] public string BackupPath { get; set; }
         [DataMember(EmitDefaultValue = false)] public bool Changed { get; set; }

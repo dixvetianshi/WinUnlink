@@ -9,23 +9,40 @@ using Microsoft.Win32.SafeHandles;
 
 namespace WinUnlink
 {
-    public sealed class FileSnapshot
+    public sealed class ItemSnapshot
     {
         public string Path { get; private set; }
         public string Identity { get; private set; }
         public long Length { get; private set; }
         public bool IsReadOnly { get; private set; }
+        public bool IsDirectory { get; private set; }
+        public string CanonicalPath { get; private set; }
 
-        internal FileSnapshot(string path, string identity, long length, bool readOnly)
+        internal ItemSnapshot(string path, string identity, long length, bool readOnly, bool isDirectory, string canonicalPath)
         {
             Path = path;
             Identity = identity;
             Length = length;
             IsReadOnly = readOnly;
+            IsDirectory = isDirectory;
+            CanonicalPath = canonicalPath;
         }
     }
 
     public enum OperationStatus { Completed, Scheduled, Failed, Partial }
+
+    internal sealed class EntryCreationException : IOException
+    {
+        internal string CreatedPath { get; private set; }
+        internal int ErrorCode { get; private set; }
+        internal EntryCreationException(string path, Exception cause)
+            : base("临时文件夹已创建，但身份检查未完成。保留位置：" + path + "\r\n" + cause.Message, cause)
+        {
+            CreatedPath = path;
+            Win32Exception native = cause as Win32Exception;
+            ErrorCode = native == null ? 0 : native.NativeErrorCode;
+        }
+    }
 
     public sealed class FileOperationResult
     {
@@ -75,7 +92,14 @@ namespace WinUnlink
         private const int FileDispositionInfoEx = 21;
         private const int FileRenameInfoEx = 22;
 
-        public static FileSnapshot Inspect(string path)
+        public static ItemSnapshot Inspect(string path)
+        {
+            ItemSnapshot item = InspectEntry(path);
+            RequireSnapshot(item);
+            return item;
+        }
+
+        internal static ItemSnapshot InspectEntry(string path)
         {
             string normalized = NormalizePath(path);
             using (SafeFileHandle handle = Open(normalized, ReadAttributes, ShareAll, OpenExisting))
@@ -84,11 +108,18 @@ namespace WinUnlink
             }
         }
 
-        public static FileOperationResult Delete(FileSnapshot target)
+        public static FileOperationResult Delete(ItemSnapshot target)
+        {
+            try { RequireSnapshot(target); }
+            catch (ArgumentException error) { return ExceptionFailure("删除失败", error); }
+            return DeleteEntry(target);
+        }
+
+        internal static FileOperationResult DeleteEntry(ItemSnapshot target)
         {
             try
             {
-                RequireSnapshot(target);
+                RequireEntry(target);
                 bool posix;
                 int error;
                 using (SafeFileHandle handle = Open(target.Path, DeleteAccess | ReadAttributes,
@@ -102,7 +133,7 @@ namespace WinUnlink
                 // A legacy disposition can succeed while another handle keeps
                 // the name delete-pending. That is not a reusable pathname.
                 int probeError;
-                FileSnapshot remaining = TryInspectNormalized(target.Path, out probeError);
+                ItemSnapshot remaining = TryInspectNormalized(target.Path, out probeError);
                 if (remaining == null && (probeError == 2 || probeError == 3))
                     return Success(OperationStatus.Completed, "文件名已删除。旧的共享删除句柄可继续访问原文件内容。", null);
                 if (remaining != null && !String.Equals(remaining.Identity, target.Identity, StringComparison.Ordinal))
@@ -125,7 +156,7 @@ namespace WinUnlink
             }
         }
 
-        public static FileOperationResult Replace(FileSnapshot target, string replacementSource)
+        public static FileOperationResult Replace(ItemSnapshot target, string replacementSource)
         {
             OwnedStage stage = null;
             bool committed = false;
@@ -163,7 +194,7 @@ namespace WinUnlink
             }
         }
 
-        public static FileOperationResult ScheduleDelete(FileSnapshot target)
+        public static FileOperationResult ScheduleDelete(ItemSnapshot target)
         {
             try
             {
@@ -182,7 +213,7 @@ namespace WinUnlink
             }
         }
 
-        public static FileOperationResult ScheduleReplace(FileSnapshot target, string replacementSource)
+        public static FileOperationResult ScheduleReplace(ItemSnapshot target, string replacementSource)
         {
             OwnedStage stage = null;
             try
@@ -211,22 +242,36 @@ namespace WinUnlink
             }
         }
 
-        private static void RequireSnapshot(FileSnapshot target)
+        private static void RequireSnapshot(ItemSnapshot target)
         {
-            if (target == null || String.IsNullOrEmpty(target.Path) || String.IsNullOrEmpty(target.Identity))
-                throw new ArgumentException("请先选择并检查一个现有的普通文件。");
+            RequireEntry(target);
+            if (target.IsDirectory)
+                throw new ArgumentException("此接口仅支持单个文件；请使用文件夹操作。");
         }
 
-        internal static void VerifyTarget(FileSnapshot target)
+        private static void RequireEntry(ItemSnapshot target)
         {
+            if (target == null || String.IsNullOrEmpty(target.Path) || String.IsNullOrEmpty(target.Identity))
+                throw new ArgumentException("请先选择并检查现有的文件或文件夹。");
+        }
+
+        internal static void VerifyTarget(ItemSnapshot target)
+        {
+            RequireSnapshot(target);
+            VerifyEntry(target);
+        }
+
+        internal static void VerifyEntry(ItemSnapshot target)
+        {
+            RequireEntry(target);
             using (SafeFileHandle handle = Open(target.Path, ReadAttributes, ShareAll, OpenExisting))
                 MatchTarget(handle, target);
         }
 
-        private static void MatchTarget(SafeFileHandle handle, FileSnapshot target)
+        private static void MatchTarget(SafeFileHandle handle, ItemSnapshot target)
         {
-            FileSnapshot current = Snapshot(handle, target.Path);
-            if (!String.Equals(current.Identity, target.Identity, StringComparison.Ordinal))
+            ItemSnapshot current = Snapshot(handle, target.Path);
+            if (current.IsDirectory != target.IsDirectory || !String.Equals(current.Identity, target.Identity, StringComparison.Ordinal))
                 throw new IOException("目标文件身份已改变。为避免操作另一个文件，请刷新目标后重新确认。");
         }
 
@@ -243,7 +288,7 @@ namespace WinUnlink
             return handle;
         }
 
-        private static FileSnapshot Snapshot(SafeFileHandle handle, string normalizedPath)
+        private static ItemSnapshot Snapshot(SafeFileHandle handle, string normalizedPath)
         {
             ByHandleFileInformation info;
             if (!Native.GetFileInformationByHandle(handle, out info))
@@ -251,8 +296,6 @@ namespace WinUnlink
                 int error = Marshal.GetLastWin32Error();
                 throw new Win32Exception(error, "无法确认文件身份：" + normalizedPath + ErrorSuffix(error));
             }
-            if ((info.FileAttributes & DirectoryAttribute) != 0)
-                throw new ArgumentException("仅支持单个文件，不支持目录：" + normalizedPath);
             if ((info.FileAttributes & ReparsePointAttribute) != 0)
                 throw new ArgumentException("不支持把符号链接、重解析点或云占位文件作为目标：" + normalizedPath);
             ulong length = ((ulong)info.FileSizeHigh << 32) | info.FileSizeLow;
@@ -260,11 +303,14 @@ namespace WinUnlink
                 throw new IOException("文件长度超过此项目支持的范围：" + normalizedPath);
             string identity = info.VolumeSerialNumber.ToString("X8") + ":" +
                 info.FileIndexHigh.ToString("X8") + info.FileIndexLow.ToString("X8");
-            return new FileSnapshot(normalizedPath, identity, (long)length,
-                (info.FileAttributes & ReadOnlyAttribute) != 0);
+            int canonicalError;
+            string canonicalPath = TryActualPath(handle, out canonicalError);
+            bool isDirectory = (info.FileAttributes & DirectoryAttribute) != 0;
+            return new ItemSnapshot(normalizedPath, identity, isDirectory ? 0 : (long)length,
+                (info.FileAttributes & ReadOnlyAttribute) != 0, isDirectory, canonicalPath);
         }
 
-        private static FileSnapshot TryInspectNormalized(string normalizedPath, out int error)
+        private static ItemSnapshot TryInspectNormalized(string normalizedPath, out int error)
         {
             SafeFileHandle handle = Native.CreateFile(ToNativePath(normalizedPath), ReadAttributes,
                 ShareAll, IntPtr.Zero, OpenExisting, NormalAttribute | OpenReparsePoint | BackupSemantics, IntPtr.Zero);
@@ -278,7 +324,7 @@ namespace WinUnlink
             {
                 try
                 {
-                    FileSnapshot result = Snapshot(handle, normalizedPath);
+                    ItemSnapshot result = Snapshot(handle, normalizedPath);
                     error = 0;
                     return result;
                 }
@@ -322,7 +368,7 @@ namespace WinUnlink
             finally { Marshal.FreeHGlobal(buffer); }
         }
 
-        private static OwnedStage CopySource(FileSnapshot target, string replacementSource)
+        private static OwnedStage CopySource(ItemSnapshot target, string replacementSource)
         {
             string sourcePath = NormalizePath(replacementSource);
             // Excluding write sharing refuses ordinary existing and future
@@ -330,36 +376,14 @@ namespace WinUnlink
             using (SafeFileHandle source = Open(sourcePath, GenericRead | ReadAttributes,
                 ShareRead | ShareDelete, OpenExisting))
             {
-                FileSnapshot sourceInfo = Snapshot(source, sourcePath);
+                ItemSnapshot sourceInfo = Snapshot(source, sourcePath);
+                RequireSnapshot(sourceInfo);
                 if (String.Equals(sourceInfo.Identity, target.Identity, StringComparison.Ordinal))
                     throw new ArgumentException("替换来源与目标是同一个文件（包括硬链接别名），请另选来源文件。");
                 OwnedStage stage = CreateStage(target.Path);
                 try
                 {
-                    byte[] buffer = new byte[65536];
-                    for (;;)
-                    {
-                        uint read;
-                        if (!Native.ReadFile(source, buffer, (uint)buffer.Length, out read, IntPtr.Zero))
-                        {
-                            int error = Marshal.GetLastWin32Error();
-                            throw new Win32Exception(error, "读取替换来源失败：" + sourcePath + ErrorSuffix(error));
-                        }
-                        if (read == 0) break;
-                        uint written;
-                        if (!Native.WriteFile(stage.Handle, buffer, read, out written, IntPtr.Zero))
-                        {
-                            int error = Marshal.GetLastWin32Error();
-                            throw new Win32Exception(error, "写入临时替换文件失败：" + stage.Path + ErrorSuffix(error));
-                        }
-                        if (written != read)
-                            throw new Win32Exception(29, "写入临时替换文件不完整，原目标没有被覆盖。");
-                    }
-                    if (!Native.FlushFileBuffers(stage.Handle))
-                    {
-                        int error = Marshal.GetLastWin32Error();
-                        throw new Win32Exception(error, "刷新临时替换文件失败：" + stage.Path + ErrorSuffix(error));
-                    }
+                    CopyBytes(source, stage.Handle, sourcePath, stage.Path);
                     return stage;
                 }
                 catch (Exception ex)
@@ -392,6 +416,105 @@ namespace WinUnlink
             throw new IOException("无法取得唯一的临时替换文件名，请稍后重试。");
         }
 
+        internal static ItemSnapshot CopyNewFile(ItemSnapshot source, string destination)
+        {
+            RequireSnapshot(source);
+            string normalized = NormalizePath(destination);
+            OwnedStage stage = null;
+            try
+            {
+                using (SafeFileHandle sourceHandle = Open(source.Path, GenericRead | ReadAttributes,
+                    ShareRead | ShareDelete, OpenExisting))
+                {
+                    MatchTarget(sourceHandle, source);
+                    stage = new OwnedStage(normalized, Open(normalized,
+                        GenericRead | GenericWrite | DeleteAccess | ReadAttributes, 0, CreateNew));
+                    CopyBytes(sourceHandle, stage.Handle, source.Path, normalized);
+                    ItemSnapshot created = Snapshot(stage.Handle, normalized);
+                    stage.Preserve = true;
+                    return created;
+                }
+            }
+            catch (Exception error)
+            {
+                if (stage != null)
+                {
+                    int cleanupError;
+                    if (!stage.Clean(out cleanupError))
+                        throw new StagePreparationException(error, stage.Path, cleanupError);
+                }
+                throw;
+            }
+            finally { if (stage != null) stage.Dispose(); }
+        }
+
+        private static void CopyBytes(SafeFileHandle source, SafeFileHandle destination,
+            string sourcePath, string destinationPath)
+        {
+            byte[] buffer = new byte[65536];
+            for (;;)
+            {
+                uint read;
+                if (!Native.ReadFile(source, buffer, (uint)buffer.Length, out read, IntPtr.Zero))
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    throw new Win32Exception(error, "读取来源失败：" + sourcePath + ErrorSuffix(error));
+                }
+                if (read == 0) break;
+                uint written;
+                if (!Native.WriteFile(destination, buffer, read, out written, IntPtr.Zero))
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    throw new Win32Exception(error, "写入临时文件失败：" + destinationPath + ErrorSuffix(error));
+                }
+                if (written != read)
+                    throw new Win32Exception(29, "临时文件写入不完整，原目标没有被覆盖。");
+            }
+            if (!Native.FlushFileBuffers(destination))
+            {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(error, "刷新临时文件失败：" + destinationPath + ErrorSuffix(error));
+            }
+        }
+
+        internal static ItemSnapshot CreateNewDirectory(string path)
+        {
+            string normalized = NormalizePath(path);
+            if (!Native.CreateDirectory(ToNativePath(normalized), IntPtr.Zero))
+            {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(error, "无法创建新的临时文件夹：" + normalized + ErrorSuffix(error));
+            }
+            try { return InspectEntry(normalized); }
+            catch (Exception cause)
+            {
+                if (!Expected(cause)) throw;
+                throw new EntryCreationException(normalized, cause);
+            }
+        }
+
+        internal static ItemSnapshot MoveEntry(ItemSnapshot source, string destination)
+        {
+            RequireEntry(source);
+            string normalized = NormalizePath(destination);
+            using (SafeFileHandle handle = Open(source.Path, DeleteAccess | ReadAttributes,
+                ShareAll, OpenExisting))
+            {
+                MatchTarget(handle, source);
+                int error;
+                bool accepted = Rename(handle, normalized, FileRenameInfoEx, 0, out error);
+                if (!accepted && Unsupported(error)) accepted = Rename(handle, normalized, FileRenameInfo, 0, out error);
+                if (!accepted)
+                    throw new Win32Exception(error, "无法移动文件或文件夹：" + source.Path + " → " + normalized + ErrorSuffix(error));
+                int nameError;
+                string canonical = TryActualPath(handle, out nameError);
+                // Native acceptance commits the move. Preserve that state even
+                // if name lookup is unavailable; consumers verify it separately.
+                return new ItemSnapshot(normalized, source.Identity, source.Length,
+                    source.IsReadOnly, source.IsDirectory, canonical);
+            }
+        }
+
         private static bool RenameStage(OwnedStage stage, string targetPath, out int error)
         {
             if (Rename(stage.Handle, targetPath, FileRenameInfoEx, 0x43, out error)) return true;
@@ -412,7 +535,7 @@ namespace WinUnlink
             }
 
             int targetError;
-            FileSnapshot finalTarget = TryInspectNormalized(targetPath, out targetError);
+            ItemSnapshot finalTarget = TryInspectNormalized(targetPath, out targetError);
             if (finalTarget != null && String.Equals(finalTarget.Identity, stagedIdentity, StringComparison.Ordinal))
                 return Success(OperationStatus.Completed,
                     "已用新文件替换目标，并核实目标文件身份。来源文件保留；仍持有旧共享删除句柄的程序继续访问旧内容，新打开的程序访问新内容。", null);
@@ -502,7 +625,7 @@ namespace WinUnlink
             return result;
         }
 
-        private static string NormalizePath(string input)
+        internal static string NormalizePath(string input)
         {
             if (String.IsNullOrWhiteSpace(input)) throw new ArgumentException("请选择一个文件路径。");
             if (input.IndexOf('\0') >= 0) throw new ArgumentException("文件路径包含空字符。");
@@ -565,7 +688,7 @@ namespace WinUnlink
             return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
         }
 
-        private static string ToNativePath(string normalized)
+        internal static string ToNativePath(string normalized)
         {
             string native = normalized.StartsWith("\\\\", StringComparison.Ordinal)
                 ? "\\\\?\\UNC\\" + normalized.Substring(2) : "\\\\?\\" + normalized;
@@ -650,7 +773,7 @@ namespace WinUnlink
             internal readonly string StagePath;
             internal readonly int CleanupError;
             internal StagePreparationException(Exception inner, string path, int cleanupError)
-                : base("临时替换文件准备失败，且清理未完成。", inner)
+                : base("临时替换文件准备失败，且清理未完成。保留位置：" + path + "\r\n" + inner.Message, inner)
             {
                 StagePath = path;
                 CleanupError = cleanupError;
@@ -717,6 +840,9 @@ namespace WinUnlink
 
         private static class Native
         {
+            [DllImport("kernel32.dll", EntryPoint = "CreateDirectoryW", CharSet = CharSet.Unicode, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool CreateDirectory(string path, IntPtr security);
             [DllImport("kernel32.dll", EntryPoint = "CreateFileW", CharSet = CharSet.Unicode, SetLastError = true)]
             internal static extern SafeFileHandle CreateFile(string path, uint access, uint share,
                 IntPtr security, uint disposition, uint flags, IntPtr template);

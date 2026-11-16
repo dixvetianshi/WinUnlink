@@ -8,6 +8,16 @@ $testRoot = Join-Path $caseDirectory ('cli-' + $testId)
 $fixturePath = Join-Path $testRoot '命令行 测试.txt'
 $existingReport = Join-Path $testRoot 'existing.json'
 $scanReport = Join-Path $testRoot 'scan.json'
+$folderFixture = Join-Path $testRoot '文件夹 扫描'
+$folderNested = Join-Path $folderFixture 'nested'
+$folderEmpty = Join-Path $folderFixture 'empty'
+$folderOne = Join-Path $folderFixture 'one.txt'
+$folderTwo = Join-Path $folderNested 'two.txt'
+$folderReport = Join-Path $testRoot 'folder-scan.json'
+[System.IO.Directory]::CreateDirectory($folderNested) | Out-Null
+[System.IO.Directory]::CreateDirectory($folderEmpty) | Out-Null
+[System.IO.File]::WriteAllText($folderOne, 'folder-one')
+[System.IO.File]::WriteAllText($folderTwo, 'folder-two')
 [System.IO.File]::WriteAllText($fixturePath, 'original fixture', (New-Object System.Text.UTF8Encoding($false)))
 [System.IO.File]::WriteAllText($existingReport, 'keep existing report')
 
@@ -72,7 +82,12 @@ try {
     $result = Invoke-TestCli @('--scan',$fixturePath)
     $scan = $result.Output | ConvertFrom-Json
     Assert-Test ($result.Code -eq 0 -and $scan.Success -and $scan.Message.Contains('查询完成')) 'CLI JSON stdout preserves Chinese UTF-8 without an attached console'
-    Write-Output 'RESULT CLI tests passed=4 failed=0'
+    $result = Invoke-TestCli @('--scan',$folderFixture,'--report',$folderReport)
+    $folderScan = [System.IO.File]::ReadAllText($folderReport) | ConvertFrom-Json
+    Assert-Test ($result.Code -eq 0 -and $folderScan.Success -and $folderScan.IsDirectory -and
+        $folderScan.FileCount -eq 2 -and $folderScan.DirectoryCount -eq 3 -and $folderScan.Target -eq $folderFixture -and
+        [System.IO.File]::ReadAllText($folderOne) -eq 'folder-one' -and [System.IO.File]::ReadAllText($folderTwo) -eq 'folder-two') 'CLI folder scan preserves the tree and reports recursive counts'
+    Write-Output 'RESULT CLI tests passed=5 failed=0'
     if ($AllowRegistryTests) {
         $result = Invoke-TestCli @('--install-menu','--yes','--report')
         Assert-Test ($result.Code -eq 1 -and $result.Error.Contains('缺少路径') -and (Get-MenuFingerprint) -eq $before) 'Explicit registry CLI regression: missing report rejects menu write'
@@ -82,10 +97,16 @@ try {
 } finally {
     $verifiedRoot = [System.IO.Path]::GetFullPath((Join-Path (Join-Path ([System.IO.Path]::GetDirectoryName($Executable)) 'cases') ('cli-' + $testId)))
     if ([System.IO.Path]::GetFullPath($testRoot) -eq $verifiedRoot) {
-        foreach ($ownedFile in @($fixturePath,$existingReport,$scanReport)) {
+        foreach ($ownedFile in @($fixturePath,$existingReport,$scanReport,$folderReport)) {
             if ([System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($ownedFile)) -ne $verifiedRoot) { throw 'Owned test cleanup path mismatch.' }
             [System.IO.File]::Delete($ownedFile)
         }
+        if ([System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($folderFixture)) -ne $verifiedRoot) { throw 'Folder fixture cleanup path mismatch.' }
+        [System.IO.File]::Delete($folderOne)
+        [System.IO.File]::Delete($folderTwo)
+        [System.IO.Directory]::Delete($folderNested, $false)
+        [System.IO.Directory]::Delete($folderEmpty, $false)
+        [System.IO.Directory]::Delete($folderFixture, $false)
         [System.IO.Directory]::Delete($verifiedRoot, $false)
     }
 }

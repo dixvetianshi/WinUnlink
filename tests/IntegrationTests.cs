@@ -55,6 +55,9 @@ namespace WinUnlinkTests
                 Run("stop-and-delete rejects a changed target before stopping", StopAndDeleteChangedTarget);
                 Run("stop-and-delete records mixed process outcomes without deleting", StopAndDeleteMixed);
                 Run("stop-and-delete with no occupying processes", StopAndDeleteEmpty);
+                Run("default target deletion rejects a changed identity before recycling", DefaultDeleteRejectsChangedTarget);
+                Run("recycle deletion rejects a missing target", RecycleNullSelection);
+                Run("stop-and-delete rejects an invalid delete mode before stopping", StopAndDeleteInvalidMode);
                 Run("PID creation mismatch is rejected", IdentityMismatch);
                 Run("self termination is rejected", SelfTermination);
                 Run("directories and ADS are rejected", InvalidInputs);
@@ -111,7 +114,7 @@ namespace WinUnlinkTests
         {
             string target = MakeFile("ordinary-replace.txt", OldContent);
             string source = MakeFile("ordinary-source.txt", NewContent);
-            FileSnapshot before = FileOperations.Inspect(target);
+            ItemSnapshot before = FileOperations.Inspect(target);
             Completed(FileOperations.Replace(before, source));
             Assert(Read(target) == NewContent, "The destination does not contain the replacement bytes.");
             Assert(Read(source) == NewContent, "The replacement source was modified or removed.");
@@ -133,7 +136,7 @@ namespace WinUnlinkTests
         private static void SharedDelete()
         {
             string target = MakeFile("shared-delete.txt", OldContent);
-            FileSnapshot before = FileOperations.Inspect(target);
+            ItemSnapshot before = FileOperations.Inspect(target);
             using (FixtureChild child = FixtureChild.Start(target, true))
             {
                 Completed(FileOperations.Delete(before));
@@ -150,7 +153,7 @@ namespace WinUnlinkTests
         {
             string target = MakeFile("shared-replace.txt", OldContent);
             string source = MakeFile("shared-source.txt", NewContent);
-            FileSnapshot before = FileOperations.Inspect(target);
+            ItemSnapshot before = FileOperations.Inspect(target);
             using (FixtureChild child = FixtureChild.Start(target, true))
             {
                 Completed(FileOperations.Replace(before, source));
@@ -166,7 +169,7 @@ namespace WinUnlinkTests
             string suffix = replace ? "replace" : "delete";
             string target = MakeFile("denied-" + suffix + ".txt", OldContent);
             string source = MakeFile("denied-source-" + suffix + ".txt", NewContent);
-            FileSnapshot before = FileOperations.Inspect(target);
+            ItemSnapshot before = FileOperations.Inspect(target);
             using (FixtureChild child = FixtureChild.Start(target, false))
             {
                 FileOperationResult direct = replace
@@ -215,10 +218,10 @@ namespace WinUnlinkTests
         private static void StopAndDeleteExclusive()
         {
             string target = MakeFile("stop-and-delete.zip", OldContent);
-            FileSnapshot snapshot = FileOperations.Inspect(target);
+            TargetSnapshot snapshot = TargetOperations.Inspect(target);
             using (FixtureChild child = FixtureChild.Start(target, false))
             {
-                FileOperationResult direct = FileOperations.Delete(snapshot);
+                FileOperationResult direct = TargetOperations.Delete(snapshot, DeleteMode.Permanent);
                 Failed(direct);
                 Assert(direct.ErrorCode == 32 && File.Exists(target) && child.IsAlive,
                     "The exclusive fixture did not reproduce a sharing-violation deletion failure.");
@@ -227,7 +230,7 @@ namespace WinUnlinkTests
                     selected.TerminationRestriction);
 
                 StopAndDeleteResult result = StopAndDelete.Execute(snapshot,
-                    new List<LockingProcess> { selected });
+                    new List<LockingProcess> { selected }, DeleteMode.Permanent);
                 Assert(result != null, "Stop-and-delete did not return a result.");
                 Completed(result.FileResult);
                 Assert(result.Processes != null && result.Processes.Count == 1 &&
@@ -241,7 +244,7 @@ namespace WinUnlinkTests
         private static void StopAndDeleteChangedTarget()
         {
             string target = MakeFile("stop-and-delete-changed.txt", OldContent);
-            FileSnapshot snapshot = FileOperations.Inspect(target);
+            TargetSnapshot snapshot = TargetOperations.Inspect(target);
             using (FixtureChild child = FixtureChild.Start(target, true))
             {
                 LockingProcess selected = FindChild(target, child);
@@ -250,11 +253,11 @@ namespace WinUnlinkTests
                 string movedOriginal = Path.Combine(testRoot, "stop-and-delete-original.txt");
                 File.Move(target, movedOriginal);
                 File.WriteAllText(target, "independent current target", Utf8);
-                Assert(FileOperations.Inspect(target).Identity != snapshot.Identity,
+                Assert(FileOperations.Inspect(target).Identity != snapshot.Root.Identity,
                     "The changed-target fixture did not establish a different identity.");
 
                 StopAndDeleteResult result = StopAndDelete.Execute(snapshot,
-                    new List<LockingProcess> { selected });
+                    new List<LockingProcess> { selected }, DeleteMode.Permanent);
                 Assert(result != null && result.FileResult != null &&
                     result.FileResult.Status == OperationStatus.Failed,
                     "Stop-and-delete accepted an outdated target snapshot.");
@@ -270,7 +273,7 @@ namespace WinUnlinkTests
         private static void StopAndDeleteMixed()
         {
             string target = MakeFile("stop-and-delete-mixed.txt", OldContent);
-            FileSnapshot snapshot = FileOperations.Inspect(target);
+            TargetSnapshot snapshot = TargetOperations.Inspect(target);
             using (FixtureChild first = FixtureChild.Start(target, "deny-delete-shared"))
             using (FixtureChild second = FixtureChild.Start(target, "deny-delete-shared"))
             {
@@ -294,7 +297,7 @@ namespace WinUnlinkTests
                 };
 
                 StopAndDeleteResult result = StopAndDelete.Execute(snapshot,
-                    new List<LockingProcess> { firstRecord, wrongSecond });
+                    new List<LockingProcess> { firstRecord, wrongSecond }, DeleteMode.Permanent);
                 Assert(result != null && result.FileResult != null &&
                     result.FileResult.Status == OperationStatus.Failed,
                     "Stop-and-delete attempted deletion after a process identity failure.");
@@ -308,7 +311,7 @@ namespace WinUnlinkTests
                     "The mixed result did not report the second identity refusal.");
                 Assert(first.WaitForExit(3000) && second.IsAlive && second.ReadOriginal() == OldContent,
                     "The mixed action did not preserve the distinct stopped and surviving processes.");
-                Assert(File.Exists(target) && FileOperations.Inspect(target).Identity == snapshot.Identity &&
+                Assert(File.Exists(target) && FileOperations.Inspect(target).Identity == snapshot.Root.Identity &&
                     Read(target) == OldContent, "The mixed failure removed or modified the original target.");
             }
         }
@@ -316,12 +319,63 @@ namespace WinUnlinkTests
         private static void StopAndDeleteEmpty()
         {
             string target = MakeFile("stop-and-delete-empty.txt", OldContent);
-            StopAndDeleteResult result = StopAndDelete.Execute(FileOperations.Inspect(target),
-                new List<LockingProcess>());
+            StopAndDeleteResult result = StopAndDelete.Execute(TargetOperations.Inspect(target),
+                new List<LockingProcess>(), DeleteMode.Permanent);
             Assert(result != null, "Stop-and-delete did not return a result for an empty process selection.");
             Completed(result.FileResult);
             Assert(result.Processes != null && result.Processes.Count == 0 && !File.Exists(target),
                 "An empty process selection did not directly delete the ordinary target.");
+        }
+
+        private static void DefaultDeleteRejectsChangedTarget()
+        {
+            string target = MakeFile("default-delete-stale.txt", OldContent);
+            TargetSnapshot snapshot = TargetOperations.Inspect(target);
+            string movedOriginal = Path.Combine(testRoot, "default-delete-original.txt");
+            File.Move(target, movedOriginal);
+            File.WriteAllText(target, "independent current recycle target", Utf8);
+            Assert(FileOperations.Inspect(target).Identity != snapshot.Root.Identity,
+                "The default-delete fixture did not establish a different identity.");
+
+            // Deliberately exercise the default only with a stale snapshot. Its
+            // preflight must reject the request before any recycle-bin operation.
+            FileOperationResult result = TargetOperations.Delete(snapshot);
+            Assert(result != null && result.Status == OperationStatus.Failed &&
+                !String.IsNullOrWhiteSpace(result.Message),
+                "Default target deletion did not reject an outdated snapshot before recycling.");
+            Assert(Read(target) == "independent current recycle target" && Read(movedOriginal) == OldContent,
+                "Rejected default deletion changed either the current target or the original file.");
+        }
+
+        private static void RecycleNullSelection()
+        {
+            FileOperationResult result = RecycleBinOperations.Delete(null);
+            Assert(result != null && result.Status == OperationStatus.Failed &&
+                !String.IsNullOrWhiteSpace(result.Message),
+                "Recycle deletion did not reject a missing target before any shell operation.");
+        }
+
+        private static void StopAndDeleteInvalidMode()
+        {
+            string target = MakeFile("stop-and-delete-invalid-mode.txt", OldContent);
+            TargetSnapshot snapshot = TargetOperations.Inspect(target);
+            using (FixtureChild child = FixtureChild.Start(target, false))
+            {
+                LockingProcess selected = FindChild(target, child);
+                Assert(selected.CanTerminate, "The owned holder was not eligible for termination: " +
+                    selected.TerminationRestriction);
+                StopAndDeleteResult result = StopAndDelete.Execute(snapshot,
+                    new List<LockingProcess> { selected }, (DeleteMode)Int32.MaxValue);
+                Assert(result != null && result.FileResult != null &&
+                    result.FileResult.Status == OperationStatus.Failed &&
+                    !String.IsNullOrWhiteSpace(result.FileResult.Message),
+                    "Stop-and-delete accepted an invalid deletion mode.");
+                Assert(result.Processes != null && result.Processes.Count == 0,
+                    "An invalid mode attempted to stop an occupying process.");
+                Assert(child.IsAlive && child.ReadOriginal() == OldContent && File.Exists(target) &&
+                    FileOperations.Inspect(target).Identity == snapshot.Root.Identity,
+                    "Mode preflight stopped the holder or changed the original target.");
+            }
         }
 
         private static void IdentityMismatch()
@@ -377,7 +431,7 @@ namespace WinUnlinkTests
         private static void SameFileReplacement()
         {
             string target = MakeFile("same-file.txt", OldContent);
-            FileSnapshot snapshot = FileOperations.Inspect(target);
+            ItemSnapshot snapshot = FileOperations.Inspect(target);
             Failed(FileOperations.Replace(snapshot, target));
             Assert(Read(target) == OldContent, "Same-path replacement changed the original content.");
 
@@ -395,7 +449,7 @@ namespace WinUnlinkTests
         {
             string target = MakeFile("changed-target.txt", OldContent);
             string source = MakeFile("changed-source.txt", NewContent);
-            FileSnapshot oldSnapshot = FileOperations.Inspect(target);
+            ItemSnapshot oldSnapshot = FileOperations.Inspect(target);
             string originalMoved = Path.Combine(testRoot, "changed-original-moved.txt");
             File.Move(target, originalMoved);
             File.WriteAllText(target, "independent new target", Utf8);
@@ -411,7 +465,7 @@ namespace WinUnlinkTests
         {
             string target = MakeFile("readonly-delete.txt", OldContent);
             File.SetAttributes(target, FileAttributes.ReadOnly);
-            FileSnapshot snapshot = FileOperations.Inspect(target);
+            ItemSnapshot snapshot = FileOperations.Inspect(target);
             Assert(snapshot.IsReadOnly, "Inspection lost the readonly attribute.");
             Completed(FileOperations.Delete(snapshot));
             Assert(!File.Exists(target), "Readonly deletion did not remove the pathname.");
